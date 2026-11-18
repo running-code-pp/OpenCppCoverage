@@ -78,6 +78,35 @@ namespace CppCoverage
 
 			bool isNativeModule_ = true;
 		};
+
+		//----------------------------------------------------------------------------
+		// Only patch memory that is actually executable: optimized builds can map
+		// source lines to data (switch jump tables, padding) and a 0xCC there
+		// corrupts the target and crashes it.
+		bool IsExecutableAddress(HANDLE hProcess, DWORD64 address)
+		{
+			MEMORY_BASIC_INFORMATION memoryInfo{};
+			if (VirtualQueryEx(hProcess,
+			                   reinterpret_cast<LPCVOID>(address),
+			                   &memoryInfo,
+			                   sizeof(memoryInfo)) != sizeof(memoryInfo))
+			{
+				return false;
+			}
+			if (memoryInfo.State != MEM_COMMIT)
+				return false;
+
+			switch (memoryInfo.Protect & 0xFF)
+			{
+				case PAGE_EXECUTE:
+				case PAGE_EXECUTE_READ:
+				case PAGE_EXECUTE_READWRITE:
+				case PAGE_EXECUTE_WRITECOPY:
+					return true;
+				default:
+					return false;
+			}
+		}
 	}
 
 	//----------------------------------------------------------------------------
@@ -157,6 +186,9 @@ namespace CppCoverage
 				auto addressValue =
 				    lineInfo.virtualAddress_ +
 				    reinterpret_cast<DWORD64>(moduleInfo.baseOfImage_);
+
+				if (!IsExecutableAddress(moduleInfo.hProcess_, addressValue))
+					continue;
 
 				lineNumberByAddress[addressValue].push_back(lineNumber);
 				addresses.push_back(addressValue);

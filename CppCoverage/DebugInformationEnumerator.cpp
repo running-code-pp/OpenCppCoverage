@@ -289,6 +289,13 @@ namespace CppCoverage
 		// Skip invalid lines
 		if (linenum != 0x00f00f00 && linenum != 0x00feefee)
 		{
+			// A line entry that is not a statement has no executable code.
+			// In optimized builds these entries can point at switch jump tables
+			// or other data inside .text; patching 0xCC there corrupts the data.
+			BOOL isStatement = TRUE;
+			if (lineNumber.get_statement(&isStatement) == S_OK && !isStatement)
+				return;
+
 			ULONGLONG virtualAddress = 0;
 			if (lineNumber.get_virtualAddress(&virtualAddress) != S_OK)
 				THROW("DIA: Cannot get virtual address");
@@ -299,6 +306,38 @@ namespace CppCoverage
 			    !symbol)
 			{
 				THROW("DIA: Cannot find symbol");
+			}
+
+			// Optimized modules can map a source line to non-code data, e.g.
+			// a switch jump table emitted inside .text. Writing a 0xCC
+			// breakpoint there corrupts the table and crashes the target.
+			// Only keep addresses inside the containing function/thunk code
+			// range.
+			DWORD symbolTag = 0;
+			if (symbol->get_symTag(&symbolTag) != S_OK)
+				THROW("DIA: Cannot get symbol tag");
+			if (symbolTag != SymTagEnum::SymTagFunction &&
+			    symbolTag != SymTagEnum::SymTagThunk &&
+			    symbolTag != SymTagEnum::SymTagPublicSymbol)
+			{
+				return;
+			}
+
+			DWORD symbolRva = 0;
+			if (symbol->get_relativeVirtualAddress(&symbolRva) != S_OK)
+				THROW("DIA: Cannot get symbol relative virtual address");
+
+			ULONGLONG symbolLength = 0;
+			if (symbol->get_length(&symbolLength) != S_OK)
+				THROW("DIA: Cannot get symbol length");
+			// When the size is known, the line address must be inside the
+			// function code range. A line pointing outside (e.g. to a switch
+			// jump table) must not receive a 0xCC breakpoint.
+			if (symbolLength != 0 &&
+			    (virtualAddress < symbolRva ||
+			     virtualAddress >= symbolRva + symbolLength))
+			{
+				return;
 			}
 
 			unsigned long symIndex = 0;

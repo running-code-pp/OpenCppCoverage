@@ -26,6 +26,13 @@
 
 #include "Tools/Tool.hpp"
 
+#include <iostream>
+
+#pragma warning(push)
+#pragma warning(disable: 4091)
+#include <DbgHelp.h>
+#pragma warning(pop)
+
 namespace CppCoverage
 {
 	//-------------------------------------------------------------------------
@@ -36,6 +43,51 @@ namespace CppCoverage
 			LOG_ERROR << "Debugee process terminate unexpectedly:"
 				<< "(type:" << ripInfo.dwType << ")"
 				<< GetErrorMessage(ripInfo.dwError);
+		}
+
+		// When the debuggee crashes while being debugged, WER does not create a
+		// dump. Write one from the debugger side so the failing instruction can
+		// be inspected. Set OPENCPPCOVERAGE_DUMP to choose the output path.
+		void WriteDebuggeeDump(
+			HANDLE hProcess,
+			DWORD processId,
+			HANDLE hThread,
+			DWORD threadId,
+			const EXCEPTION_RECORD* exceptionRecord)
+		{
+			CONTEXT contextRecord{};
+			contextRecord.ContextFlags = CONTEXT_FULL;
+			if (!GetThreadContext(hThread, &contextRecord))
+				return;
+
+			wchar_t dumpPath[MAX_PATH] = L"OpenCppCoverageTarget.dmp";
+			const DWORD length = GetEnvironmentVariableW(
+				L"OPENCPPCOVERAGE_DUMP", dumpPath, MAX_PATH);
+			if (length == 0 || length >= MAX_PATH)
+				wcscpy_s(dumpPath, L"OpenCppCoverageTarget.dmp");
+
+			HANDLE hFile = CreateFileW(
+				dumpPath, GENERIC_WRITE, 0, nullptr,
+				CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (hFile == INVALID_HANDLE_VALUE)
+				return;
+
+			EXCEPTION_POINTERS exceptionPointers;
+			exceptionPointers.ExceptionRecord = const_cast<EXCEPTION_RECORD*>(exceptionRecord);
+			exceptionPointers.ContextRecord = &contextRecord;
+			MINIDUMP_EXCEPTION_INFORMATION dumpInfo;
+			dumpInfo.ThreadId = threadId;
+			dumpInfo.ExceptionPointers = &exceptionPointers;
+			dumpInfo.ClientPointers = FALSE;
+
+			MiniDumpWriteDump(
+				hProcess, processId, hFile,
+				static_cast<MINIDUMP_TYPE>(MiniDumpWithFullMemory |
+					MiniDumpWithThreadInfo |
+					MiniDumpWithProcessThreadData),
+				&dumpInfo, nullptr, nullptr);
+			CloseHandle(hFile);
+			std::wcerr << L"Debuggee crash dump written to: " << dumpPath << std::endl;
 		}
 	}	
 
@@ -172,6 +224,15 @@ namespace CppCoverage
 		HANDLE hThread) const
 	{
 		const auto& exception = debugEvent.u.Exception;
+		const DWORD exceptionCode = exception.ExceptionRecord.ExceptionCode;
+		if (exceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+		    exceptionCode == EXCEPTION_STACK_OVERFLOW ||
+		    exceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION)
+		{
+			WriteDebuggeeDump(
+			    hProcess, debugEvent.dwProcessId, hThread, debugEvent.dwThreadId,
+			    &exception.ExceptionRecord);
+		}
 		auto exceptionType = debugEventsHandler.OnException(hProcess, hThread, exception);
 
 		switch (exceptionType)
